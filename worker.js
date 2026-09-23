@@ -325,6 +325,31 @@ export class Uploader extends DurableObject {
         expires_at INTEGER NOT NULL
       )
     `);
+    this.ensureColumn("users", "request_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("users", "upload_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("users", "download_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("users", "downloads_reserved", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("users", "last_upload_at", "INTEGER");
+    this.ensureColumn("users", "last_download_at", "INTEGER");
+    this.ensureColumn("admins", "username", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("channels", "username", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("channels", "join_url", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("channels", "active", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("files", "caption", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("files", "deleted", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("upload_sets", "status", "TEXT NOT NULL DEFAULT 'open'");
+    this.ensureColumn("referrals", "qualified", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("referrals", "qualified_at", "INTEGER");
+    this.ensureColumn("tickets", "status", "TEXT NOT NULL DEFAULT 'pending'");
+    this.ensureColumn("tickets", "premium_until", "INTEGER");
+    this.ensureColumn("tickets", "premium_label", "TEXT");
+    this.ensureColumn("broadcasts", "last_user_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("broadcasts", "sent_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("broadcasts", "failed_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("broadcasts", "status", "TEXT NOT NULL DEFAULT 'running'");
+    this.ensureColumn("broadcasts", "last_error", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("sessions", "data_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn("sessions", "expires_at", "INTEGER NOT NULL DEFAULT 0");
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS settings (
         id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -340,9 +365,31 @@ export class Uploader extends DurableObject {
         updated_at INTEGER NOT NULL
       )
     `);
+    this.ensureColumn("settings", "bot_username", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "storage_chat_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "storage_title", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "ticket_chat_id", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "ticket_title", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "welcome_message_id", "INTEGER");
+    this.ensureColumn("settings", "welcome_kind", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "suffix", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("settings", "created_at", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("settings", "updated_at", "INTEGER NOT NULL DEFAULT 0");
     this.ctx.storage.sql.exec(`
       INSERT OR IGNORE INTO settings(id, created_at, updated_at) VALUES(1, ?, ?)
     `, now(), now());
+    this.ctx.storage.sql.exec(`
+      UPDATE users SET downloads_reserved = 0 WHERE downloads_reserved IS NULL OR downloads_reserved < 0
+    `);
+    this.ctx.storage.sql.exec(`
+      DELETE FROM tickets
+      WHERE id NOT IN (SELECT MIN(id) FROM tickets GROUP BY user_id, ticket_day)
+    `);
+    this.ctx.storage.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS tickets_user_day_unique ON tickets(user_id, ticket_day)`);
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS users_last_seen ON users(last_seen_at DESC)`);
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS users_requests ON users(request_count DESC)`);
+    this.ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS files_deleted_id ON files(deleted, id DESC)`);
+    this.ctx.storage.sql.exec(`INSERT INTO meta(key, value) VALUES('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
   }
 
   first(sql, ...params) {
@@ -495,7 +542,11 @@ export class Uploader extends DurableObject {
     if (chat.type !== "channel") throw new Error("Target must be a Telegram channel.");
     const me = await telegram(this.env, "getMe");
     const botMember = await telegram(this.env, "getChatMember", { chat_id: chat.id, user_id: me.id });
-    if (!["administrator", "creator"].includes(String(botMember?.status))) throw new Error("Bot must be administrator in that channel.");
+    const botStatus = String(botMember?.status || "");
+    if (!["administrator", "creator"].includes(botStatus)) throw new Error("Bot must be administrator in that channel.");
+    if ((kind === "storage" || kind === "ticket") && botStatus !== "creator" && botMember?.can_post_messages === false) throw new Error("Bot does not have permission to post in this channel.");
+    if (kind === "storage" && botStatus !== "creator" && botMember?.can_delete_messages === false) throw new Error("Bot does not have permission to delete stored messages in this channel.");
+    if (kind === "required" && !chat.username && botStatus !== "creator" && botMember?.can_invite_users === false) throw new Error("Bot needs permission to invite users to this private channel.");
     if (kind === "required") {
       const existing = this.first(`SELECT id FROM channels WHERE chat_id = ?`, String(chat.id));
       if (!existing) {
@@ -896,7 +947,7 @@ export class Uploader extends DurableObject {
     const value = String(caption || "").trim() === "/none" ? "" : String(caption || "").trim().slice(0, 1024);
     const settings = this.getSettings();
     try {
-      await telegram(this.env, "editMessageCaption", { chat_id: settings.storage_chat_id, message_id: Number(file.storage_message_id), caption: value || undefined });
+      await telegram(this.env, "editMessageCaption", { chat_id: settings.storage_chat_id, message_id: Number(file.storage_message_id), caption: value });
     } catch (error) {
       throw new Error(`Caption edit failed: ${String(error?.message || error)}`);
     }
@@ -1052,14 +1103,23 @@ export class Uploader extends DurableObject {
   }
 
   async saveWelcome(userId, message) {
+    this.requireRole(userId, "full");
     const settings = this.getSettings();
+    if (String(message?.text || "").trim() === "/none") {
+      if (settings.welcome_message_id) await safeTelegram(this.env, "deleteMessage", { chat_id: settings.storage_chat_id, message_id: Number(settings.welcome_message_id) });
+      this.updateSettings({ welcome_message_id: null, welcome_kind: "" });
+      this.clearSession(userId);
+      return this.sendUser(userId, "✅ Welcome خاموش شد.", this.manageKeyboard(userId));
+    }
     const copied = await telegram(this.env, "copyMessage", {
       chat_id: settings.storage_chat_id,
       from_chat_id: String(message.chat.id),
       message_id: Number(message.message_id),
       disable_notification: true
     });
+    const oldMessageId = Number(settings.welcome_message_id || 0);
     this.updateSettings({ welcome_message_id: Number(copied.message_id), welcome_kind: messageKind(message) });
+    if (oldMessageId && oldMessageId !== Number(copied.message_id)) await safeTelegram(this.env, "deleteMessage", { chat_id: settings.storage_chat_id, message_id: oldMessageId });
     this.clearSession(userId);
     return this.sendUser(userId, "✅ Welcome Message ذخیره شد.", this.manageKeyboard(userId));
   }
@@ -1110,10 +1170,11 @@ export class Uploader extends DurableObject {
     `);
     if (!admins.length) return this.sendUser(userId, "👥 هیچ ادمینی ثبت نشده است.", this.manageKeyboard(userId));
     const text = admins.map(admin => {
-      const name = shortText([admin.first_name, admin.last_name].filter(Boolean).join(" ") || "User", 50);
-      const username = admin.live_username || admin.username || "unknown";
-      return `${name} — <code>${escapeHtml(admin.user_id)}</code> — ${adminRoleLabel(admin.role)} — @${escapeHtml(normalizeUsername(username))}`;
+      const name = shortText([admin.first_name, admin.last_name].filter(Boolean).join(" ") || "User", 28);
+      const username = shortText(normalizeUsername(admin.live_username || admin.username || "unknown"), 18);
+      return `<a href="tg://user?id=${encodeURIComponent(admin.user_id)}">${escapeHtml(name)}</a> · <code>${escapeHtml(admin.user_id)}</code> · ${adminRoleLabel(admin.role)} · @${escapeHtml(username)}`;
     }).join("\n");
+    if (text.length > CONFIG.TELEGRAM_SAFE_TEXT) throw new Error("Admin list is too large. Remove some admins or use the paginated view.");
     const buttons = admins.flatMap(admin => [[btn(`🗑 حذف ${admin.user_id}`, `admin:del:${admin.user_id}`, "danger")]]);
     buttons.push([btn("🏠 مدیریت", "manage:home", "primary")]);
     return this.sendUser(userId, `👥 <b>Admins</b>\n\n${text}`, { inline_keyboard: buttons });
@@ -1170,16 +1231,24 @@ export class Uploader extends DurableObject {
       LIMIT 50 OFFSET ?
     `, offset);
     if (!users.length && safePage > 0) return this.usersPage(userId, safePage - 1);
-    const lines = [
+    const userLines = users.map((user, index) => {
+      const name = shortText(this.userDisplayName(user), 24);
+      const username = user.username ? ` · @${escapeHtml(shortText(normalizeUsername(user.username), 18))}` : "";
+      return `${offset + index + 1}. <a href="tg://user?id=${encodeURIComponent(user.user_id)}">${escapeHtml(name)}</a> · <code>${escapeHtml(user.user_id)}</code>${username} · req:${Number(user.request_count || 0)} · up:${Number(user.upload_count || 0)} · dl:${Number(user.download_count || 0)}`;
+    });
+    let lines = [
       `👥 <b>Users</b> · page ${safePage + 1}`,
       `Total: <b>${total}</b>`,
       "",
-      ...users.map((user, index) => {
-        const name = this.userDisplayName(user);
-        const username = user.username ? ` · @${escapeHtml(normalizeUsername(user.username))}` : "";
-        return `${offset + index + 1}. <a href="tg://user?id=${encodeURIComponent(user.user_id)}">${escapeHtml(name)}</a> · <code>${escapeHtml(user.user_id)}</code>${username} · req:${Number(user.request_count || 0)} · dl:${Number(user.download_count || 0)}`;
-      })
+      ...userLines
     ];
+    if (lines.join("\n").length > CONFIG.TELEGRAM_SAFE_TEXT) {
+      lines = [
+        `👥 <b>Users</b> · page ${safePage + 1} · ${total}`,
+        "",
+        ...users.map((user, index) => `${offset + index + 1}. <a href="tg://user?id=${encodeURIComponent(user.user_id)}">${escapeHtml(shortText(this.userDisplayName(user), 18))}</a> · req:${Number(user.request_count || 0)} · dl:${Number(user.download_count || 0)}`)
+      ];
+    }
     const rows = users.map(user => [btn(`👁 ${shortText(this.userDisplayName(user), 28)}`, `users:view:${user.user_id}`, "primary")]);
     const nav = [];
     if (safePage > 0) nav.push(btn("◀️ قبلی", `users:page:${safePage - 1}`, "primary"));
@@ -1265,31 +1334,42 @@ export class Uploader extends DurableObject {
       return this.sendUser(userId, `💎 Premium شما فعال است. باقی‌مانده: ${label}`);
     }
     const today = unixDay();
-    const ticket = this.first(`SELECT id FROM tickets WHERE user_id = ? AND ticket_day = ? LIMIT 1`, String(userId), today);
-    if (ticket) return this.sendUser(userId, "🎫 امروز یک Ticket برای خرید Premium ثبت کرده‌ای. تا تعیین تکلیف همان Ticket، Ticket دیگری در همان روز ساخته نمی‌شود.");
+    let ticketId = 0;
+    try {
+      ticketId = this.execInsertId(`INSERT INTO tickets(user_id, ticket_day, channel_message_id, created_at, status) VALUES(?, ?, 0, ?, 'pending')`, String(userId), today, now());
+    } catch (error) {
+      if (/unique|constraint/i.test(String(error?.message || error))) return this.sendUser(userId, "🎫 امروز یک Ticket برای خرید Premium ثبت کرده‌ای. تا تعیین تکلیف همان Ticket، Ticket دیگری در همان روز ساخته نمی‌شود.");
+      throw error;
+    }
     const user = this.first(`SELECT * FROM users WHERE user_id = ?`, String(userId));
     const name = shortText([user?.first_name, user?.last_name].filter(Boolean).join(" ") || "User", 80);
     const username = user?.username ? `@${normalizeUsername(user.username)}` : "بدون username";
-    const message = await telegram(this.env, "sendMessage", {
-      chat_id: settings.ticket_chat_id,
-      text: [
-        "🎫 <b>Premium Ticket</b>",
-        "",
-        `User ID: <code>${escapeHtml(userId)}</code>`,
-        `Name: <b>${escapeHtml(name)}</b>`,
-        `Username: <b>${escapeHtml(username)}</b>`,
-        `Created: <code>${new Date().toISOString()}</code>`,
-        "",
-        "برای تعیین مدت Premium روی تأیید کلیک کنید."
-      ].join("\n"),
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [
-          [btn("✅ تأیید Premium", `ticket:approve:${String(userId)}`, "success")]
-        ]
-      }
-    });
-    this.ctx.storage.sql.exec(`INSERT INTO tickets(user_id, ticket_day, channel_message_id, created_at) VALUES(?, ?, ?, ?)`, String(userId), today, Number(message.message_id), now());
+    try {
+      const message = await telegram(this.env, "sendMessage", {
+        chat_id: settings.ticket_chat_id,
+        text: [
+          "🎫 <b>Premium Ticket</b>",
+          "",
+          `Ticket ID: <code>${ticketId}</code>`,
+          `User ID: <code>${escapeHtml(userId)}</code>`,
+          `Name: <b>${escapeHtml(name)}</b>`,
+          `Username: <b>${escapeHtml(username)}</b>`,
+          `Created: <code>${new Date().toISOString()}</code>`,
+          "",
+          "برای تعیین مدت Premium روی تأیید کلیک کنید."
+        ].join("\n"),
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [btn("✅ تأیید Premium", `ticket:approve:${ticketId}`, "success")]
+          ]
+        }
+      });
+      this.ctx.storage.sql.exec(`UPDATE tickets SET channel_message_id = ? WHERE id = ?`, Number(message?.message_id || 0), ticketId);
+    } catch (error) {
+      this.ctx.storage.sql.exec(`DELETE FROM tickets WHERE id = ? AND status = 'pending'`, ticketId);
+      throw error;
+    }
     return this.sendUser(userId, "🎫 Ticket ثبت شد و به بخش خرید Premium ارسال شد. حداکثر روزی یک Ticket تا زمان فعال شدن Premium.");
   }
 
@@ -1305,11 +1385,14 @@ export class Uploader extends DurableObject {
     });
   }
 
-  async approveTicketPrompt(userId, targetUserId) {
+  async approveTicketPrompt(userId, ticketId) {
     this.requireRole(userId, "full");
-    const ticket = this.first(`SELECT * FROM tickets WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`, String(targetUserId));
+    const ticket = this.first(`SELECT * FROM tickets WHERE id = ? AND status = 'pending'`, Number(ticketId));
     if (!ticket) throw new Error("Pending ticket not found.");
-    this.setSession(userId, "premium_approve", { ticketId: Number(ticket.id), targetUserId: String(targetUserId) });
+    const ticketChatId = String(this.getSettings().ticket_chat_id || "");
+    const activeMessageId = Number(ticket.channel_message_id || 0);
+    if (!ticketChatId || !activeMessageId) throw new Error("Ticket message is invalid.");
+    this.setSession(userId, "premium_approve", { ticketId: Number(ticket.id), targetUserId: String(ticket.user_id) });
     return this.premiumDurations(userId);
   }
 
@@ -1354,6 +1437,8 @@ export class Uploader extends DurableObject {
   async handleUserStart(message, startArg) {
     const userId = String(message.from.id);
     this.upsertUser(message.from);
+    const currentSettings = this.getSettings();
+    if (!currentSettings.bot_username) await this.getBotInfo();
     const existing = this.first(`SELECT referral_invited_by FROM users WHERE user_id = ?`, userId);
     const arg = String(startArg || "");
     if (!existing?.referral_invited_by && arg.startsWith("ref_")) {
@@ -1389,44 +1474,44 @@ export class Uploader extends DurableObject {
         if (await this.gate(userId, true)) await this.sendUser(userId, "✅ عضویت کامل تأیید شد. حالا می‌توانی لینک فایل را باز کنی.", this.userKeyboard(userId));
         return;
       }
-      if (data === "user:home") return this.sendUser(userId, "🏠 خانه", this.userKeyboard(userId));
-      if (data === "user:quota") return this.sendQuotaPage(userId);
-      if (data === "premium:buy") return this.ticketPurchase(userId);
-      if (data === "upload:single") return this.startUpload(userId, "single");
-      if (data === "upload:multi") return this.startUpload(userId, "multi");
-      if (data === "upload:stop") return this.finishUpload(userId);
+      if (data === "user:home") return await this.sendUser(userId, "🏠 خانه", this.userKeyboard(userId));
+      if (data === "user:quota") return await this.sendQuotaPage(userId);
+      if (data === "premium:buy") return await this.ticketPurchase(userId);
+      if (data === "upload:single") return await this.startUpload(userId, "single");
+      if (data === "upload:multi") return await this.startUpload(userId, "multi");
+      if (data === "upload:stop") return await this.finishUpload(userId);
       if (data === "admin:home") {
         this.requireRole(userId, "upload");
-        return this.sendUser(userId, "🛠 پنل آپلود", this.adminKeyboard(userId));
+        return await this.sendUser(userId, "🛠 پنل آپلود", this.adminKeyboard(userId));
       }
-      if (data === "admin:list") return this.adminList(userId);
+      if (data === "admin:list") return await this.adminList(userId);
       if (data.startsWith("file:del:")) {
-        return this.deleteFile(userId, data.slice("file:del:".length));
+        return await this.deleteFile(userId, data.slice("file:del:".length));
       }
-      if (data.startsWith("file:edit:")) return this.editFile(userId, data.slice("file:edit:".length));
-      if (data === "manage:home") return this.managementPanel(userId);
-      if (data === "users:list") return this.usersPage(userId, 0);
-      if (data.startsWith("users:page:")) return this.usersPage(userId, data.slice("users:page:".length));
-      if (data.startsWith("users:view:")) return this.userDetails(userId, data.slice("users:view:".length));
-      if (data.startsWith("users:message:")) return this.startUserMessage(userId, data.slice("users:message:".length));
-      if (data === "stats:show") return this.stats(userId);
-      if (data === "admins:list") return this.adminListManagement(userId);
-      if (data === "admins:add") return this.addAdminInput(userId);
-      if (data.startsWith("admin:addrole:")) return this.saveAdmin(userId, data.slice("admin:addrole:".length));
-      if (data.startsWith("admin:del:")) return this.deleteAdmin(userId, data.slice("admin:del:".length));
+      if (data.startsWith("file:edit:")) return await this.editFile(userId, data.slice("file:edit:".length));
+      if (data === "manage:home") return await this.managementPanel(userId);
+      if (data === "users:list") return await this.usersPage(userId, 0);
+      if (data.startsWith("users:page:")) return await this.usersPage(userId, data.slice("users:page:".length));
+      if (data.startsWith("users:view:")) return await this.userDetails(userId, data.slice("users:view:".length));
+      if (data.startsWith("users:message:")) return await this.startUserMessage(userId, data.slice("users:message:".length));
+      if (data === "stats:show") return await this.stats(userId);
+      if (data === "admins:list") return await this.adminListManagement(userId);
+      if (data === "admins:add") return await this.addAdminInput(userId);
+      if (data.startsWith("admin:addrole:")) return await this.saveAdmin(userId, data.slice("admin:addrole:".length));
+      if (data.startsWith("admin:del:")) return await this.deleteAdmin(userId, data.slice("admin:del:".length));
       if (data === "cfg:storage") {
         this.requireRole(userId, "full");
         this.setSession(userId, "channel_storage", {});
-        return this.sendUser(userId, "💾 ID یا @username کانال Storage را بفرست. Bot باید آنجا Administrator باشد.");
+        return await this.sendUser(userId, "💾 ID یا @username کانال Storage را بفرست. Bot باید آنجا Administrator باشد.");
       }
       if (data === "cfg:ticket") {
         this.requireRole(userId, "full");
         this.setSession(userId, "channel_ticket", {});
-        return this.sendUser(userId, "🎫 ID یا @username کانال Ticket را بفرست. Bot باید Administrator باشد.");
+        return await this.sendUser(userId, "🎫 ID یا @username کانال Ticket را بفرست. Bot باید Administrator باشد.");
       }
       if (data === "cfg:channels") {
         this.requireRole(userId, "full");
-        return this.sendUser(userId, `📢 کانال‌های اجباری:\n\n${escapeHtml(this.requiredChannelsText())}`, {
+        return await this.sendUser(userId, `📢 کانال‌های اجباری:\n\n${escapeHtml(this.requiredChannelsText())}`, {
           inline_keyboard: [
             [btn("➕ افزودن کانال", "cfg:channel_add", "success")],
             [btn("🗑 حذف کانال", "cfg:channel_delete", "danger")],
@@ -1437,34 +1522,38 @@ export class Uploader extends DurableObject {
       if (data === "cfg:channel_add") {
         this.requireRole(userId, "full");
         this.setSession(userId, "channel_required", {});
-        return this.sendUser(userId, "📢 ID یا @username کانال اجباری را بفرست. Bot باید Administrator باشد و کانال باید قابل عضویت باشد.");
+        return await this.sendUser(userId, "📢 ID یا @username کانال اجباری را بفرست. Bot باید Administrator باشد و کانال باید قابل عضویت باشد.");
       }
       if (data === "cfg:channel_delete") {
         this.requireRole(userId, "full");
         const channels = this.all(`SELECT id, title FROM channels WHERE active = 1 ORDER BY id`);
-        return this.sendUser(userId, "کانالی که می‌خواهی حذف شود:", { inline_keyboard: channels.map(channel => [btn(`🗑 #${channel.id} ${shortText(channel.title, 35)}`, `channel:del:${channel.id}`, "danger")]).concat([[btn("↩️ برگشت", "cfg:channels", "primary")]]) });
+        return await this.sendUser(userId, "کانالی که می‌خواهی حذف شود:", { inline_keyboard: channels.map(channel => [btn(`🗑 #${channel.id} ${shortText(channel.title, 35)}`, `channel:del:${channel.id}`, "danger")]).concat([[btn("↩️ برگشت", "cfg:channels", "primary")]]) });
       }
       if (data.startsWith("channel:del:")) {
         this.requireRole(userId, "full");
         const id = Number(data.slice("channel:del:".length));
         this.ctx.storage.sql.exec(`DELETE FROM channels WHERE id = ?`, id);
-        return this.managementPanel(userId);
+        return await this.managementPanel(userId);
       }
-      if (data === "cfg:welcome") return this.setWelcome(userId);
-      if (data === "cfg:suffix") return this.setSuffix(userId);
-      if (data === "cfg:broadcast") return this.broadcastInput(userId);
+      if (data === "cfg:welcome") return await this.setWelcome(userId);
+      if (data === "cfg:suffix") return await this.setSuffix(userId);
+      if (data === "cfg:broadcast") return await this.broadcastInput(userId);
       if (data === "ticket:done") return null;
       if (data.startsWith("ticket:approve:")) {
         this.requireRole(userId, "full");
         const ticketChatId = String(this.getSettings().ticket_chat_id || "");
+        const ticketId = Number(data.slice("ticket:approve:".length));
+        const ticket = this.first(`SELECT id, user_id, channel_message_id, status FROM tickets WHERE id = ?`, ticketId);
+        if (!ticket || String(ticket.status) !== "pending") throw new Error("Pending ticket not found.");
         if (!message?.chat?.id || String(message.chat.id) !== ticketChatId) throw new Error("This ticket button is not valid here.");
-        return this.approveTicketPrompt(userId, data.slice("ticket:approve:".length));
+        if (Number(message.message_id || 0) !== Number(ticket.channel_message_id || 0)) throw new Error("This ticket button is stale.");
+        return await this.approveTicketPrompt(userId, ticketId);
       }
-      if (data.startsWith("premium:dur:")) return this.activatePremium(userId, data.slice("premium:dur:".length));
+      if (data.startsWith("premium:dur:")) return await this.activatePremium(userId, data.slice("premium:dur:".length));
       if (data.startsWith("ref:copy:")) {
-        return this.sendUser(userId, `🔗 لینک دعوت شما:\n${this.refLink(userId) || "not ready"}`);
+        return await this.sendUser(userId, `🔗 لینک دعوت شما:\n${this.refLink(userId) || "not ready"}`);
       }
-      return this.sendUser(userId, "دستور این دکمه منقضی شده است.", this.userKeyboard(userId));
+      return await this.sendUser(userId, "دستور این دکمه منقضی شده است.", this.userKeyboard(userId));
     } catch (error) {
       await this.sendUser(userId, `❌ ${escapeHtml(String(error?.message || error))}`, this.userKeyboard(userId));
     }
@@ -1528,7 +1617,10 @@ export class Uploader extends DurableObject {
     if (isUploadMessage(message) && this.canUpload(userId)) {
       return this.sendUser(userId, "یک حالت آپلود را از منو انتخاب کن.", this.adminKeyboard(userId));
     }
-    return this.sendWelcome(userId);
+    if (isUploadMessage(message)) {
+      return this.sendUser(userId, "📎 برای دریافت فایل، لینک فایل را باز کن.", this.userKeyboard(userId));
+    }
+    return this.sendUser(userId, "از منوی زیر استفاده کن.", this.userKeyboard(userId));
   }
 
   async command(message, parsed) {
