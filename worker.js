@@ -1,6 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
 const CONFIG = Object.freeze({
+  BOT_TOKEN: "8426761408:AAEkzTm3TSmhJvsGWKCzG3XnMNHWgpO7U7s",
+  WEBHOOK_SECRET: "UploaderWebhook_2026_9F4k7P2m8Qx3Vt6Z",
   FREE_DOWNLOADS: 2,
   MAX_SINGLE_UPLOADS: 10,
   MAX_MULTI_UPLOADS: 100,
@@ -26,7 +28,7 @@ function getOwnerId(env) {
 }
 
 function getBotToken(env) {
-  return envValue(env, "BOT_TOKEN");
+  return envValue(env, "BOT_TOKEN", CONFIG.BOT_TOKEN) || CONFIG.BOT_TOKEN;
 }
 
 function apiBase(env) {
@@ -127,6 +129,11 @@ function messageLabel(message) {
   return "Message";
 }
 
+function isStorageUnavailableError(error) {
+  const text = String(error?.message || error || "").toLowerCase();
+  return /message to copy not found|message not found|message_id_invalid|chat not found|have no access to the message|bad request: message to copy/.test(text);
+}
+
 async function telegram(env, method, body = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), CONFIG.TELEGRAM_TIMEOUT_MS);
@@ -190,6 +197,11 @@ export class Uploader extends DurableObject {
     ctx.blockConcurrencyWhile(async () => {
       this.migrate();
     });
+  }
+
+  ensureColumn(table, column, definition) {
+    const columns = this.ctx.storage.sql.exec(`PRAGMA table_info(${table})`).toArray();
+    if (!columns.some(row => String(row.name) === column)) this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   migrate() {
@@ -413,7 +425,8 @@ export class Uploader extends DurableObject {
         username = excluded.username,
         first_name = excluded.first_name,
         last_name = excluded.last_name,
-        last_seen_at = excluded.last_seen_at
+        last_seen_at = excluded.last_seen_at,
+        blocked = 0
     `,
       userId,
       String(user?.username || ""),
@@ -422,6 +435,10 @@ export class Uploader extends DurableObject {
       now(),
       now()
     );
+  }
+
+  recordRequest(userId) {
+    this.ctx.storage.sql.exec(`UPDATE users SET request_count = request_count + 1, last_seen_at = ? WHERE user_id = ?`, now(), String(userId));
   }
 
   session(userId) {
@@ -466,8 +483,7 @@ export class Uploader extends DurableObject {
   }
 
   async verifyWebhook(request) {
-    const expected = envValue(this.env, "WEBHOOK_SECRET");
-    if (!expected) return true;
+    const expected = envValue(this.env, "WEBHOOK_SECRET", CONFIG.WEBHOOK_SECRET) || CONFIG.WEBHOOK_SECRET;
     return String(request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "") === expected;
   }
 
@@ -480,32 +496,28 @@ export class Uploader extends DurableObject {
     const me = await telegram(this.env, "getMe");
     const botMember = await telegram(this.env, "getChatMember", { chat_id: chat.id, user_id: me.id });
     if (!["administrator", "creator"].includes(String(botMember?.status))) throw new Error("Bot must be administrator in that channel.");
-    let joinUrl = "";
-    if (chat.username) {
-      joinUrl = `https://t.me/${chat.username}`;
-    } else {
-      const invite = await safeTelegram(this.env, "createChatInviteLink", { chat_id: chat.id });
-      joinUrl = invite.ok ? String(invite.result?.invite_link || "") : "";
-    }
     if (kind === "required") {
+      const existing = this.first(`SELECT id FROM channels WHERE chat_id = ?`, String(chat.id));
+      if (!existing) {
+        const count = Number(this.first(`SELECT COUNT(*) AS count FROM channels WHERE active = 1`)?.count || 0);
+        if (count >= CONFIG.MAX_REQUIRED_CHANNELS) throw new Error(`Maximum ${CONFIG.MAX_REQUIRED_CHANNELS} required channels allowed.`);
+      }
+      let joinUrl = chat.username ? `https://t.me/${chat.username}` : "";
+      if (!joinUrl) {
+        const invite = await safeTelegram(this.env, "createChatInviteLink", { chat_id: chat.id });
+        joinUrl = invite.ok ? String(invite.result?.invite_link || "") : "";
+      }
       if (!joinUrl) throw new Error("Could not obtain a join link for this channel.");
-      const count = Number(this.first(`SELECT COUNT(*) AS count FROM channels WHERE active = 1`)?.count || 0);
-      if (count >= CONFIG.MAX_REQUIRED_CHANNELS) throw new Error(`Maximum ${CONFIG.MAX_REQUIRED_CHANNELS} required channels allowed.`);
       this.ctx.storage.sql.exec(`
         INSERT INTO channels(chat_id, title, username, join_url, active, created_at)
         VALUES(?, ?, ?, ?, 1, ?)
         ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, username = excluded.username, join_url = excluded.join_url, active = 1
       `, String(chat.id), String(chat.title || ""), chat.username ? `@${chat.username}` : "", joinUrl, now());
     }
-    if (kind === "storage") {
-      this.updateSettings({ storage_chat_id: String(chat.id), storage_title: String(chat.title || "") });
-    }
-    if (kind === "ticket") {
-      this.updateSettings({ ticket_chat_id: String(chat.id), ticket_title: String(chat.title || "") });
-    }
+    if (kind === "storage") this.updateSettings({ storage_chat_id: String(chat.id), storage_title: String(chat.title || chat.username || chat.id) });
+    if (kind === "ticket") this.updateSettings({ ticket_chat_id: String(chat.id), ticket_title: String(chat.title || chat.username || chat.id) });
     return chat;
   }
-
   async channelsSatisfied(userId) {
     const channels = this.all(`SELECT * FROM channels WHERE active = 1 ORDER BY id ASC`);
     if (!channels.length) return { ok: true, missing: [] };
@@ -513,9 +525,7 @@ export class Uploader extends DurableObject {
     for (const channel of channels) {
       try {
         const member = await telegram(this.env, "getChatMember", { chat_id: channel.chat_id, user_id: String(userId) });
-        if (!["member", "administrator", "creator"].includes(String(member?.status))) {
-          missing.push(channel);
-        }
+        if (!["member", "administrator", "creator"].includes(String(member?.status))) missing.push(channel);
       } catch (error) {
         missing.push({ ...channel, error: String(error?.message || error) });
       }
@@ -523,10 +533,10 @@ export class Uploader extends DurableObject {
     return { ok: missing.length === 0, missing };
   }
 
-  async qualifyReferral(userId) {
+  async qualifyReferral(userId, membership = null) {
     const user = this.first(`SELECT referral_invited_by, referral_qualified FROM users WHERE user_id = ?`, String(userId));
     if (!user?.referral_invited_by || Number(user.referral_qualified)) return false;
-    const channels = await this.channelsSatisfied(userId);
+    const channels = membership || await this.channelsSatisfied(userId);
     if (!channels.ok) return false;
     const changed = this.ctx.storage.sql.exec(`
       UPDATE users SET referral_qualified = 1 WHERE user_id = ? AND referral_qualified = 0
@@ -550,7 +560,7 @@ export class Uploader extends DurableObject {
 
   async gate(userId, notify = true) {
     const result = await this.channelsSatisfied(userId);
-    await this.qualifyReferral(userId);
+    await this.qualifyReferral(userId, result);
     if (result.ok) return true;
     if (notify) await this.sendMembershipGate(userId, result.missing);
     return false;
@@ -574,26 +584,40 @@ export class Uploader extends DurableObject {
   }
 
   availableDownloads(userId) {
-    const user = this.first(`SELECT downloads_used, referral_downloads FROM users WHERE user_id = ?`, String(userId));
+    const user = this.first(`SELECT downloads_used, referral_downloads, downloads_reserved FROM users WHERE user_id = ?`, String(userId));
     if (!user) return 0;
-    return Math.max(0, CONFIG.FREE_DOWNLOADS - Number(user.downloads_used || 0)) + Number(user.referral_downloads || 0);
+    const freeLeft = Math.max(0, CONFIG.FREE_DOWNLOADS - Number(user.downloads_used || 0));
+    const referral = Math.max(0, Number(user.referral_downloads || 0));
+    return Math.max(0, freeLeft + referral - Number(user.downloads_reserved || 0));
   }
 
-  spendDownload(userId) {
-    const user = this.first(`SELECT downloads_used, referral_downloads FROM users WHERE user_id = ?`, String(userId));
-    if (!user) throw new Error("User not found.");
-    const freeLeft = Math.max(0, CONFIG.FREE_DOWNLOADS - Number(user.downloads_used || 0));
-    if (freeLeft > 0) {
-      this.ctx.storage.sql.exec(`UPDATE users SET downloads_used = downloads_used + 1 WHERE user_id = ?`, String(userId));
-      return "free";
-    }
-    if (Number(user.referral_downloads || 0) > 0) {
-      this.ctx.storage.sql.exec(`UPDATE users SET referral_downloads = referral_downloads - 1 WHERE user_id = ?`, String(userId));
-      return "referral";
-    }
+  reserveDownload(userId) {
+    const id = String(userId);
+    const free = this.ctx.storage.sql.exec(`
+      UPDATE users
+      SET downloads_used = downloads_used + 1, downloads_reserved = downloads_reserved + 1
+      WHERE user_id = ? AND downloads_used < ?
+    `, id, CONFIG.FREE_DOWNLOADS);
+    if (Number(free.changes || 0)) return "free";
+    const referral = this.ctx.storage.sql.exec(`
+      UPDATE users
+      SET referral_downloads = referral_downloads - 1, downloads_reserved = downloads_reserved + 1
+      WHERE user_id = ? AND referral_downloads > 0
+    `, id);
+    if (Number(referral.changes || 0)) return "referral";
     throw new Error("Download quota exceeded.");
   }
 
+  commitDownload(userId) {
+    this.ctx.storage.sql.exec(`UPDATE users SET downloads_reserved = CASE WHEN downloads_reserved > 0 THEN downloads_reserved - 1 ELSE 0 END, download_count = download_count + 1, last_download_at = ? WHERE user_id = ?`, now(), String(userId));
+  }
+
+  refundDownload(userId, kind) {
+    const id = String(userId);
+    if (kind === "free") this.ctx.storage.sql.exec(`UPDATE users SET downloads_used = CASE WHEN downloads_used > 0 THEN downloads_used - 1 ELSE 0 END, downloads_reserved = CASE WHEN downloads_reserved > 0 THEN downloads_reserved - 1 ELSE 0 END WHERE user_id = ?`, id);
+    else if (kind === "referral") this.ctx.storage.sql.exec(`UPDATE users SET referral_downloads = referral_downloads + 1, downloads_reserved = CASE WHEN downloads_reserved > 0 THEN downloads_reserved - 1 ELSE 0 END WHERE user_id = ?`, id);
+    else this.ctx.storage.sql.exec(`UPDATE users SET downloads_reserved = CASE WHEN downloads_reserved > 0 THEN downloads_reserved - 1 ELSE 0 END WHERE user_id = ?`, id);
+  }
   refLink(userId) {
     const settings = this.getSettings();
     const username = String(settings.bot_username || "");
@@ -613,19 +637,24 @@ export class Uploader extends DurableObject {
       chat_id: settings.storage_chat_id,
       from_chat_id: String(message.chat.id),
       message_id: Number(message.message_id),
-      disable_notification: true
+      disable_notification: true,
+      protect_content: false
     });
-    const tokenBytes = crypto.getRandomValues(new Uint8Array(10));
-    const token = Array.from(tokenBytes, byte => byte.toString(36).padStart(2, "0")).join("").slice(0, 16);
+    const token = Array.from(crypto.getRandomValues(new Uint8Array(12)), byte => byte.toString(16).padStart(2, "0")).join("");
     const caption = String(message.caption || "").slice(0, 1024);
     const label = messageLabel(message);
-    const id = this.execInsertId(`
-      INSERT INTO files(token, owner_id, storage_message_id, kind, label, caption, created_at)
-      VALUES(?, ?, ?, ?, ?, ?, ?)
-    `, token, String(ownerId), Number(copied?.message_id || 0), messageKind(message), label, caption, now());
-    return this.first(`SELECT * FROM files WHERE id = ?`, id);
+    try {
+      const id = this.execInsertId(`
+        INSERT INTO files(token, owner_id, storage_message_id, kind, label, caption, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+      `, token, String(ownerId), Number(copied?.message_id || 0), messageKind(message), label, caption, now());
+      this.ctx.storage.sql.exec(`UPDATE users SET upload_count = upload_count + 1, last_upload_at = ? WHERE user_id = ?`, now(), String(ownerId));
+      return this.first(`SELECT * FROM files WHERE id = ?`, id);
+    } catch (error) {
+      await safeTelegram(this.env, "deleteMessage", { chat_id: settings.storage_chat_id, message_id: Number(copied?.message_id || 0) });
+      throw error;
+    }
   }
-
   newUploadSet(userId, mode) {
     return this.execInsertId(`INSERT INTO upload_sets(owner_id, mode, created_at) VALUES(?, ?, ?)`, String(userId), String(mode), now());
   }
@@ -651,66 +680,64 @@ export class Uploader extends DurableObject {
     this.ctx.storage.sql.exec(`UPDATE upload_sets SET status = 'closed' WHERE id = ?`, Number(setId));
   }
 
-  async deliverFile(userId, file) {
-    if (!file || Number(file.deleted)) throw new Error("This file is unavailable.");
-    if (!(await this.gate(userId, true))) return false;
-    if (!this.isPremium(userId) && this.availableDownloads(userId) <= 0) {
-      await this.sendQuotaPage(userId);
-      return false;
-    }
+  async copyStoredFile(userId, file) {
     const settings = this.getSettings();
-    let copied;
+    if (!settings.storage_chat_id) throw new Error("Storage channel is not configured.");
     try {
-      copied = await telegram(this.env, "copyMessage", {
+      return await telegram(this.env, "copyMessage", {
         chat_id: String(userId),
         from_chat_id: settings.storage_chat_id,
         message_id: Number(file.storage_message_id),
         protect_content: false
       });
     } catch (error) {
-      this.ctx.storage.sql.exec(`UPDATE files SET deleted = 1 WHERE id = ?`, Number(file.id));
+      if (isStorageUnavailableError(error)) this.ctx.storage.sql.exec(`UPDATE files SET deleted = 1 WHERE id = ?`, Number(file.id));
       throw new Error(`Stored file is unavailable: ${String(error?.message || error)}`);
     }
-    if (!this.isPremium(userId)) this.spendDownload(userId);
-    if (settings.suffix) await this.sendUser(userId, settings.suffix);
-    return copied;
+  }
+
+  async deliverFile(userId, file) {
+    if (!file || Number(file.deleted)) throw new Error("This file is unavailable.");
+    if (!(await this.gate(userId, true))) return false;
+    const premium = this.isPremium(userId);
+    let reservation = null;
+    if (!premium) reservation = this.reserveDownload(userId);
+    try {
+      await this.copyStoredFile(userId, file);
+      if (!premium) this.commitDownload(userId);
+      const suffix = this.getSettings().suffix;
+      if (suffix) await this.sendUser(userId, suffix);
+      return true;
+    } catch (error) {
+      if (!premium) this.refundDownload(userId, reservation);
+      throw error;
+    }
   }
 
   async deliverSet(userId, setId) {
     const items = this.setItems(setId);
     if (!items.length) throw new Error("Upload set is empty.");
     if (!(await this.gate(userId, true))) return false;
-    const count = items.length;
-    if (!this.isPremium(userId)) {
-      const available = this.availableDownloads(userId);
-      if (available < count) {
-        await this.sendQuotaPage(userId);
-        return false;
-      }
+    const premium = this.isPremium(userId);
+    if (!premium && this.availableDownloads(userId) < items.length) {
+      await this.sendQuotaPage(userId);
+      return false;
     }
     for (const item of items) {
-      await this.deliverFileWithoutGate(userId, item);
-      if (!this.isPremium(userId)) this.spendDownload(userId);
-      if (this.getSettings().suffix) await this.sendUser(userId, this.getSettings().suffix);
+      let reservation = null;
+      if (!premium) reservation = this.reserveDownload(userId);
+      try {
+        await this.copyStoredFile(userId, item);
+        if (!premium) this.commitDownload(userId);
+        const suffix = this.getSettings().suffix;
+        if (suffix) await this.sendUser(userId, suffix);
+      } catch (error) {
+        if (!premium) this.refundDownload(userId, reservation);
+        throw error;
+      }
     }
     return true;
   }
-
-  async deliverFileWithoutGate(userId, file) {
-    const settings = this.getSettings();
-    try {
-      await telegram(this.env, "copyMessage", {
-        chat_id: String(userId),
-        from_chat_id: settings.storage_chat_id,
-        message_id: Number(file.storage_message_id),
-        protect_content: false
-      });
-    } catch (error) {
-      this.ctx.storage.sql.exec(`UPDATE files SET deleted = 1 WHERE id = ?`, Number(file.id));
-      throw new Error(`Stored file is unavailable: ${String(error?.message || error)}`);
-    }
-  }
-
   async sendQuotaPage(userId) {
     const link = this.refLink(userId);
     const count = this.first(`SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ? AND qualified = 1`, String(userId));
@@ -735,25 +762,27 @@ export class Uploader extends DurableObject {
 
   async sendWelcome(userId) {
     const settings = this.getSettings();
-    if (!settings.welcome_message_id || !settings.storage_chat_id) {
-      return this.sendUser(userId, "👋 خوش آمدی! برای شروع از منوی زیر استفاده کن.", this.userKeyboard(userId));
+    if (!settings.welcome_message_id || !settings.storage_chat_id) return this.sendUser(userId, "👋 خوش آمدی! برای شروع از منوی زیر استفاده کن.", this.userKeyboard(userId));
+    try {
+      await telegram(this.env, "copyMessage", {
+        chat_id: String(userId),
+        from_chat_id: settings.storage_chat_id,
+        message_id: Number(settings.welcome_message_id),
+        protect_content: false
+      });
+      return this.sendUser(userId, "", this.userKeyboard(userId), true);
+    } catch {
+      return this.sendUser(userId, "👋 خوش آمدی! پیام خوش‌آمدگویی فعلاً قابل ارسال نیست.", this.userKeyboard(userId));
     }
-    await telegram(this.env, "copyMessage", {
-      chat_id: String(userId),
-      from_chat_id: settings.storage_chat_id,
-      message_id: Number(settings.welcome_message_id),
-      protect_content: false
-    });
-    return this.sendUser(userId, "", this.userKeyboard(userId), true);
   }
 
   userKeyboard(userId) {
     const role = this.roleFor(userId);
     const rows = [
-      [btn("📥 تک‌فایل", "upload:single", "success"), btn("📚 چندتایی", "upload:multi", "success")],
       [btn("🎁 سهمیه و دعوت", "user:quota", "primary"), btn("💎 Premium", "premium:buy", "primary")],
       [btn("🔄 بررسی عضویت", "gate:check", "success")]
     ];
+    if (role === "upload" || role === "full" || role === "owner") rows.unshift([btn("📥 تک‌فایل", "upload:single", "success"), btn("📚 چندتایی", "upload:multi", "success")]);
     if (this.canUpload(userId)) rows.push([btn("🛠 پنل آپلود", "admin:home", "primary")]);
     if (role === "owner" || role === "full") rows.push([btn("⚙️ مدیریت", "manage:home", "primary")]);
     return { inline_keyboard: rows };
@@ -764,7 +793,8 @@ export class Uploader extends DurableObject {
     return telegram(this.env, "sendMessage", {
       chat_id: String(userId),
       text: String(text || " "),
-      disable_web_page_preview: true,
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
       reply_markup: replyMarkup || undefined
     });
   }
@@ -810,7 +840,7 @@ export class Uploader extends DurableObject {
     this.setSession(userId, "upload", { ...data, count: count + 1 });
     const link = this.fileLink(file.token);
     if (mode === "single") {
-      await this.sendUser(userId, `✅ فایل ${position}/${limit} ذخیره شد.\n\n${messageLabel(message)}\n${link}`, this.uploadModeKeyboard());
+      await this.sendUser(userId, `✅ فایل ${position}/${limit} ذخیره شد.\n\n${escapeHtml(messageLabel(message))}\n${escapeHtml(link)}`, this.uploadModeKeyboard());
       if (count + 1 >= limit) {
         this.clearSession(userId);
         await this.sendUser(userId, "✅ سقف ۱۰ فایل رسید؛ حالت آپلود بسته شد.", this.userKeyboard(userId));
@@ -830,7 +860,7 @@ export class Uploader extends DurableObject {
     const items = this.setItems(setId);
     if (!items.length) return this.sendUser(userId, "هیچ فایلی در این آپلود ثبت نشد.", this.userKeyboard(userId));
     const lines = ["✅ آپلود کامل شد.", ""];
-    items.forEach((item, index) => lines.push(`${index + 1}. ${messageLabel({ [item.kind]: true })} — ${this.fileLink(item.token)}`));
+    items.forEach((item, index) => lines.push(`${index + 1}. ${escapeHtml(item.label || item.kind)} — ${escapeHtml(this.fileLink(item.token))}`));
     if (mode === "single") lines.push("", "لینک‌ها همان زمانِ هر آپلود نیز ارسال شدند.");
     await this.sendUser(userId, lines.join("\n"), this.userKeyboard(userId));
   }
@@ -881,9 +911,7 @@ export class Uploader extends DurableObject {
       [btn("📥 تک‌فایل", "upload:single", "success"), btn("📚 چندتایی", "upload:multi", "success")],
       [btn("📋 فایل‌های من", "admin:list", "primary")]
     ];
-    if (role === "owner" || role === "full") {
-      rows.push([btn("📊 آمار", "stats:show", "primary")], [btn("⚙️ تنظیمات", "manage:home", "primary")]);
-    }
+    if (role === "owner" || role === "full") rows.push([btn("📊 آمار", "stats:show", "primary"), btn("👥 کاربران", "users:list", "primary")], [btn("⚙️ تنظیمات", "manage:home", "primary")]);
     rows.push([btn("🏠 خانه", "user:home", "primary")]);
     return { inline_keyboard: rows };
   }
@@ -1002,7 +1030,8 @@ export class Uploader extends DurableObject {
       [btn("💾 Storage Channel", "cfg:storage", "primary"), btn("🎫 Ticket Channel", "cfg:ticket", "primary")],
       [btn("📢 Required Channels", "cfg:channels", "primary"), btn("👋 Welcome", "cfg:welcome", "primary")],
       [btn("📝 Suffix", "cfg:suffix", "primary"), btn("📣 Broadcast", "cfg:broadcast", "primary")],
-      [btn("📊 Statistics", "stats:show", "primary"), btn("👥 Admins", "admins:list", "primary")]
+      [btn("📊 Statistics", "stats:show", "primary"), btn("👥 Users", "users:list", "primary")],
+      [btn("🛡 Admins", "admins:list", "primary")]
     ];
     if (this.roleFor(userId) === "owner") rows.push([btn("➕ Add Admin", "admins:add", "success")]);
     rows.push([btn("🔄 Refresh", "manage:home", "primary"), btn("🏠 Home", "user:home", "primary")]);
@@ -1036,17 +1065,19 @@ export class Uploader extends DurableObject {
   }
 
   async addAdminInput(userId) {
-    this.canManageAdmins(userId) || (() => { throw new Error("Only the primary owner can manage admins."); })();
+    if (!this.canManageAdmins(userId)) throw new Error("Only the primary owner can manage admins.");
     this.setSession(userId, "admin_add", {});
     return this.sendUser(userId, "👤 آیدی عددی Telegram کاربر را بفرست. سپس نقش را انتخاب می‌کنی. کاربر باید حداقل یک‌بار با Bot تعامل کرده باشد تا بتوانی اطلاعاتش را ثبت کنی.");
   }
 
   async createAdmin(userId, targetId) {
-    this.canManageAdmins(userId) || (() => { throw new Error("Only the primary owner can manage admins."); })();
+    if (!this.canManageAdmins(userId)) throw new Error("Only the primary owner can manage admins.");
     const value = String(targetId || "").trim();
     if (!/^\d+$/.test(value)) throw new Error("Telegram user ID must be numeric.");
+    if (value === getOwnerId(this.env)) throw new Error("Primary owner cannot be added as an admin.");
+    const existing = this.first(`SELECT user_id FROM admins WHERE user_id = ?`, value);
     const current = Number(this.first(`SELECT COUNT(*) AS count FROM admins`)?.count || 0);
-    if (current >= CONFIG.MAX_ADMINS) throw new Error(`Maximum ${CONFIG.MAX_ADMINS} admins allowed.`);
+    if (!existing && current >= CONFIG.MAX_ADMINS) throw new Error(`Maximum ${CONFIG.MAX_ADMINS} admins allowed.`);
     this.setSession(userId, "admin_role", { targetId: value });
     return this.sendUser(userId, "نقش ادمین را انتخاب کن:", {
       inline_keyboard: [[btn("📤 Upload Admin", `admin:addrole:upload`, "primary"), btn("👑 Full Admin", `admin:addrole:full`, "danger")], [btn("↩️ لغو", "manage:home", "primary")]]
@@ -1054,7 +1085,7 @@ export class Uploader extends DurableObject {
   }
 
   async saveAdmin(userId, role) {
-    this.canManageAdmins(userId) || (() => { throw new Error("Only the primary owner can manage admins."); })();
+    if (!this.canManageAdmins(userId)) throw new Error("Only the primary owner can manage admins.");
     const session = this.session(userId);
     const targetId = String(session?.data?.targetId || "");
     if (!targetId) throw new Error("Admin setup session expired.");
@@ -1071,12 +1102,21 @@ export class Uploader extends DurableObject {
 
   async adminListManagement(userId) {
     this.requireRole(userId, "full");
-    const admins = this.all(`SELECT * FROM admins ORDER BY created_at DESC`);
+    const admins = this.all(`
+      SELECT a.*, u.first_name, u.last_name, u.username AS live_username
+      FROM admins a
+      LEFT JOIN users u ON u.user_id = a.user_id
+      ORDER BY a.created_at DESC
+    `);
     if (!admins.length) return this.sendUser(userId, "👥 هیچ ادمینی ثبت نشده است.", this.manageKeyboard(userId));
-    const text = admins.map(admin => `${admin.user_id} — ${adminRoleLabel(admin.role)} — @${admin.username || "unknown"}`).join("\n");
+    const text = admins.map(admin => {
+      const name = shortText([admin.first_name, admin.last_name].filter(Boolean).join(" ") || "User", 50);
+      const username = admin.live_username || admin.username || "unknown";
+      return `${name} — <code>${escapeHtml(admin.user_id)}</code> — ${adminRoleLabel(admin.role)} — @${escapeHtml(normalizeUsername(username))}`;
+    }).join("\n");
     const buttons = admins.flatMap(admin => [[btn(`🗑 حذف ${admin.user_id}`, `admin:del:${admin.user_id}`, "danger")]]);
     buttons.push([btn("🏠 مدیریت", "manage:home", "primary")]);
-    return this.sendUser(userId, `👥 <b>Admins</b>\n\n${escapeHtml(text)}`, { inline_keyboard: buttons });
+    return this.sendUser(userId, `👥 <b>Admins</b>\n\n${text}`, { inline_keyboard: buttons });
   }
 
   async deleteAdmin(userId, targetId) {
@@ -1096,6 +1136,9 @@ export class Uploader extends DurableObject {
     const qualified = Number(this.first(`SELECT COUNT(*) AS count FROM referrals WHERE qualified = 1`)?.count || 0);
     const tickets = Number(this.first(`SELECT COUNT(*) AS count FROM tickets WHERE status = 'pending'`)?.count || 0);
     const broadcasts = Number(this.first(`SELECT COUNT(*) AS count FROM broadcasts WHERE status = 'running'`)?.count || 0);
+    const requests = Number(this.first(`SELECT COALESCE(SUM(request_count), 0) AS total FROM users`)?.total || 0);
+    const uploads = Number(this.first(`SELECT COALESCE(SUM(upload_count), 0) AS total FROM users`)?.total || 0);
+    const downloads = Number(this.first(`SELECT COALESCE(SUM(download_count), 0) AS total FROM users`)?.total || 0);
     return this.sendUser(userId, [
       "📊 <b>Statistics</b>",
       "",
@@ -1103,10 +1146,114 @@ export class Uploader extends DurableObject {
       `Active 24h: <b>${activeUsers}</b>`,
       `Premium: <b>${premium}</b>`,
       `Active files: <b>${files}</b>`,
+      `Requests: <b>${requests}</b>`,
+      `Uploads: <b>${uploads}</b>`,
+      `Downloads: <b>${downloads}</b>`,
       `Qualified referrals: <b>${qualified}</b>`,
       `Pending tickets: <b>${tickets}</b>`,
       `Running broadcasts: <b>${broadcasts}</b>`
     ].join("\n"), this.manageKeyboard(userId));
+  }
+
+  userDisplayName(user) {
+    return shortText([user?.first_name, user?.last_name].filter(Boolean).join(" ") || (user?.username ? `@${user.username}` : "User"), 70);
+  }
+
+  async usersPage(userId, page = 0) {
+    this.requireRole(userId, "full");
+    const safePage = Math.max(0, Math.floor(Number(page) || 0));
+    const offset = safePage * 50;
+    const total = Number(this.first(`SELECT COUNT(*) AS count FROM users`)?.count || 0);
+    const users = this.all(`
+      SELECT * FROM users
+      ORDER BY last_seen_at DESC, user_id ASC
+      LIMIT 50 OFFSET ?
+    `, offset);
+    if (!users.length && safePage > 0) return this.usersPage(userId, safePage - 1);
+    const lines = [
+      `👥 <b>Users</b> · page ${safePage + 1}`,
+      `Total: <b>${total}</b>`,
+      "",
+      ...users.map((user, index) => {
+        const name = this.userDisplayName(user);
+        const username = user.username ? ` · @${escapeHtml(normalizeUsername(user.username))}` : "";
+        return `${offset + index + 1}. <a href="tg://user?id=${encodeURIComponent(user.user_id)}">${escapeHtml(name)}</a> · <code>${escapeHtml(user.user_id)}</code>${username} · req:${Number(user.request_count || 0)} · dl:${Number(user.download_count || 0)}`;
+      })
+    ];
+    const rows = users.map(user => [btn(`👁 ${shortText(this.userDisplayName(user), 28)}`, `users:view:${user.user_id}`, "primary")]);
+    const nav = [];
+    if (safePage > 0) nav.push(btn("◀️ قبلی", `users:page:${safePage - 1}`, "primary"));
+    if (offset + users.length < total) nav.push(btn("بعدی ▶️", `users:page:${safePage + 1}`, "primary"));
+    if (nav.length) rows.push(nav);
+    rows.push([btn("🔄 Refresh", `users:page:${safePage}`, "primary"), btn("🏠 مدیریت", "manage:home", "primary")]);
+    return this.sendUser(userId, lines.join("\n"), { inline_keyboard: rows });
+  }
+
+  async userDetails(userId, targetId) {
+    this.requireRole(userId, "full");
+    const id = String(targetId || "");
+    const user = this.first(`SELECT * FROM users WHERE user_id = ?`, id);
+    if (!user) throw new Error("User not found.");
+    const referrals = Number(this.first(`SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ? AND qualified = 1`, id)?.count || 0);
+    const premium = Number(user.premium_permanent) ? "دائم" : Number(user.premium_until || 0) > now() ? formatRemaining(Number(user.premium_until) - now()) : "غیرفعال";
+    const username = user.username ? `@${escapeHtml(normalizeUsername(user.username))}` : "-";
+    const name = this.userDisplayName(user);
+    const text = [
+      "👤 <b>User Details</b>",
+      "",
+      `Name: <a href="tg://user?id=${encodeURIComponent(id)}">${escapeHtml(name)}</a>`,
+      `ID: <code>${escapeHtml(id)}</code>`,
+      `Username: <b>${username}</b>`,
+      `Joined: <code>${new Date(Number(user.joined_at)).toISOString()}</code>`,
+      `Last seen: <code>${new Date(Number(user.last_seen_at)).toISOString()}</code>`,
+      "",
+      `Requests: <b>${Number(user.request_count || 0)}</b>`,
+      `Uploads: <b>${Number(user.upload_count || 0)}</b>`,
+      `Downloads: <b>${Number(user.download_count || 0)}</b>`,
+      `Free used: <b>${Number(user.downloads_used || 0)}/${CONFIG.FREE_DOWNLOADS}</b>`,
+      `Referral credits: <b>${Number(user.referral_downloads || 0)}</b>`,
+      `Successful referrals: <b>${referrals}</b>`,
+      `Premium: <b>${premium}</b>`,
+      `Blocked: <b>${Number(user.blocked) ? "YES" : "NO"}</b>`
+    ].join("\n");
+    return this.sendUser(userId, text, {
+      inline_keyboard: [
+        [btn("💬 ارسال پیام", `users:message:${id}`, "success")],
+        [btn("👤 بازگشت به Users", "users:list", "primary"), btn("🏠 مدیریت", "manage:home", "primary")]
+      ]
+    });
+  }
+
+  async startUserMessage(userId, targetId) {
+    this.requireRole(userId, "full");
+    const target = String(targetId || "");
+    const user = this.first(`SELECT user_id FROM users WHERE user_id = ?`, target);
+    if (!user) throw new Error("User not found.");
+    this.setSession(userId, "admin_user_message", { targetId: target });
+    return this.sendUser(userId, `💬 پیام برای <code>${escapeHtml(target)}</code> را در پیام بعدی بفرست. متن، عکس، ویدیو، فایل و سایر پیام‌های قابل کپی پشتیبانی می‌شوند.\n\nبرای لغو /cancel را بفرست.`);
+  }
+
+  async sendDirectUserMessage(userId, message) {
+    this.requireRole(userId, "full");
+    const session = this.session(userId);
+    const targetId = String(session?.data?.targetId || "");
+    if (!targetId) throw new Error("User message session expired.");
+    const target = this.first(`SELECT user_id, blocked FROM users WHERE user_id = ?`, targetId);
+    if (!target) throw new Error("User not found.");
+    try {
+      await telegram(this.env, "copyMessage", {
+        chat_id: targetId,
+        from_chat_id: String(message.chat.id),
+        message_id: Number(message.message_id),
+        protect_content: false
+      });
+    } catch (error) {
+      if (/blocked|deactivated|chat not found|user is deactivated/i.test(String(error?.message || error))) this.ctx.storage.sql.exec(`UPDATE users SET blocked = 1 WHERE user_id = ?`, targetId);
+      throw new Error(`ارسال پیام ناموفق بود: ${String(error?.message || error)}`);
+    }
+    this.clearSession(userId);
+    this.ctx.storage.sql.exec(`UPDATE users SET blocked = 0 WHERE user_id = ?`, targetId);
+    return this.sendUser(userId, `✅ پیام برای <code>${escapeHtml(targetId)}</code> ارسال شد.`, this.manageKeyboard(userId));
   }
 
   async ticketPurchase(userId) {
@@ -1223,7 +1370,7 @@ export class Uploader extends DurableObject {
       return;
     }
     const membership = await this.channelsSatisfied(userId);
-    await this.qualifyReferral(userId);
+    await this.qualifyReferral(userId, membership);
     await this.sendWelcome(userId);
     if (!membership.ok) await this.sendMembershipGate(userId, membership.missing);
   }
@@ -1233,6 +1380,7 @@ export class Uploader extends DurableObject {
     const userId = String(callback?.from?.id || "");
     if (!userId) return;
     this.upsertUser(callback.from);
+    this.recordRequest(userId);
     await safeTelegram(this.env, "answerCallbackQuery", { callback_query_id: callback.id });
     const data = String(callback.data || "");
     const message = callback.message;
@@ -1257,6 +1405,10 @@ export class Uploader extends DurableObject {
       }
       if (data.startsWith("file:edit:")) return this.editFile(userId, data.slice("file:edit:".length));
       if (data === "manage:home") return this.managementPanel(userId);
+      if (data === "users:list") return this.usersPage(userId, 0);
+      if (data.startsWith("users:page:")) return this.usersPage(userId, data.slice("users:page:".length));
+      if (data.startsWith("users:view:")) return this.userDetails(userId, data.slice("users:view:".length));
+      if (data.startsWith("users:message:")) return this.startUserMessage(userId, data.slice("users:message:".length));
       if (data === "stats:show") return this.stats(userId);
       if (data === "admins:list") return this.adminListManagement(userId);
       if (data === "admins:add") return this.addAdminInput(userId);
@@ -1302,7 +1454,12 @@ export class Uploader extends DurableObject {
       if (data === "cfg:suffix") return this.setSuffix(userId);
       if (data === "cfg:broadcast") return this.broadcastInput(userId);
       if (data === "ticket:done") return null;
-      if (data.startsWith("ticket:approve:")) return this.approveTicketPrompt(userId, data.slice("ticket:approve:".length));
+      if (data.startsWith("ticket:approve:")) {
+        this.requireRole(userId, "full");
+        const ticketChatId = String(this.getSettings().ticket_chat_id || "");
+        if (!message?.chat?.id || String(message.chat.id) !== ticketChatId) throw new Error("This ticket button is not valid here.");
+        return this.approveTicketPrompt(userId, data.slice("ticket:approve:".length));
+      }
       if (data.startsWith("premium:dur:")) return this.activatePremium(userId, data.slice("premium:dur:".length));
       if (data.startsWith("ref:copy:")) {
         return this.sendUser(userId, `🔗 لینک دعوت شما:\n${this.refLink(userId) || "not ready"}`);
@@ -1317,6 +1474,12 @@ export class Uploader extends DurableObject {
     const userId = String(message?.from?.id || "");
     if (!userId) return;
     this.upsertUser(message.from);
+    this.recordRequest(userId);
+    const parsedCommand = parseCommand(message.text || "");
+    if (parsedCommand?.command === "/cancel") {
+      this.clearSession(userId);
+      return this.sendUser(userId, "❎ لغو شد.", this.userKeyboard(userId));
+    }
     const session = this.session(userId);
     if (session?.mode === "upload") return this.handleUploadMessage(message, session);
     if (session?.mode === "edit_file") {
@@ -1357,6 +1520,7 @@ export class Uploader extends DurableObject {
     if (session?.mode === "admin_add") {
       return this.createAdmin(userId, message.text);
     }
+    if (session?.mode === "admin_user_message") return this.sendDirectUserMessage(userId, message);
     if (message.text) {
       const parsed = parseCommand(message.text);
       if (parsed) return this.command(message, parsed);
@@ -1383,6 +1547,7 @@ export class Uploader extends DurableObject {
       return this.sendUser(userId, "🛠 پنل آپلود", this.adminKeyboard(userId));
     }
     if (command === "/stats") return this.stats(userId);
+    if (command === "/users") return this.usersPage(userId, 0);
     if (command === "/broadcast") return this.broadcastInput(userId);
     if (command === "/premium") return this.ticketPurchase(userId);
     if (command === "/id") return this.sendUser(userId, `🆔 User ID: <code>${escapeHtml(userId)}</code>`, this.userKeyboard(userId));
@@ -1421,6 +1586,7 @@ export class Uploader extends DurableObject {
         storageConfigured: Boolean(settings.storage_chat_id),
         ticketChannelConfigured: Boolean(settings.ticket_chat_id),
         requiredChannels: Number(this.first(`SELECT COUNT(*) AS count FROM channels WHERE active = 1`)?.count || 0),
+        admins: Number(this.first(`SELECT COUNT(*) AS count FROM admins`)?.count || 0),
         users: Number(this.first(`SELECT COUNT(*) AS count FROM users`)?.count || 0),
         files: Number(this.first(`SELECT COUNT(*) AS count FROM files WHERE deleted = 0`)?.count || 0),
         alarm: await this.ctx.storage.getAlarm()
@@ -1441,7 +1607,7 @@ export class Uploader extends DurableObject {
 }
 
 async function setupBot(env, origin) {
-  const secret = envValue(env, "WEBHOOK_SECRET");
+  const secret = envValue(env, "WEBHOOK_SECRET", CONFIG.WEBHOOK_SECRET) || CONFIG.WEBHOOK_SECRET;
   const webhook = `${String(origin).replace(/\/$/, "")}/telegram`;
   await telegram(env, "setWebhook", {
     url: webhook,
@@ -1455,6 +1621,8 @@ async function setupBot(env, origin) {
     commands: [
       { command: "start", description: "Open uploader" },
       { command: "admin", description: "Open admin panel" },
+      { command: "stats", description: "Show statistics" },
+      { command: "users", description: "List users" },
       { command: "premium", description: "Buy Premium" },
       { command: "id", description: "Show Telegram ID" },
       { command: "cancel", description: "Cancel current action" }
